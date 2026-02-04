@@ -1,0 +1,336 @@
+private IGISLayer rootAggGraphic = new LayerGraphic("root", null);
+    private IGISLayer staticLayer = new StaticLayer(rootAggGraphic);
+    private IGISLayer interactiveLayer = new LayerGraphic("Interactive", rootAggGraphic);
+    private IGISLayer defaultLayer = new LayerGraphic("Default", rootAggGraphic);
+
+    private IGISLayer cartographyAggGraphic = new LayerGraphic("Cartography", staticLayer);
+    private IGISLayer drawingAggGraphic = new LayerGraphic("Drawing", interactiveLayer);
+    private IGISLayer controllerGraphicsLayer = new ImmutableLayer("Controller", defaultLayer);
+    private IGISLayer analysisLayer = new ImmutableLayer("Analysis", staticLayer);
+    private IGISLayer pointAggGraphic;// = new LayerGraphic("Point", interactiveLayer);
+
+    private IGISLayer dtedAggGraphic = null;
+    private IGISLayer nitfAggGraphic = null;
+    private IGISLayer ecdisAggGraphic = null;
+    private IGISLayer wmsLayer = null;
+    private IGISLayer wcsLayer = null;
+    private IGISLayer wfsLayer;
+
+    protected ArrayList<IGISGraphic> waitingGraphicAddEvents = new ArrayList<>();
+    public ArrayList<IGISGraphic> waitingControllerGraphicRemoveEvents = new ArrayList<>();
+    public List<IGISGraphic> waitingGraphicEvents = new ArrayList<>();
+
+    private ArrayList<IGISGraphic> controllerGraphics = new ArrayList<>();
+    private ArrayList<IGISGraphic> screenGraphics = new ArrayList<>();
+    private Map<IGISGraphic, DrawableGraphicInfo> drawableGraphicInfoMap = new HashMap<>();
+
+    private boolean addProcessFinished = false;
+
+    public Map<IGISGraphic, DrawableGraphicInfo> getDrawableGraphicInfoMap() {
+        return drawableGraphicInfoMap;
+    }
+
+    public LayerModel() {
+    }
+
+    private static final Logger LOGGER = LogManager.getLogger(LayerModel.class);
+
+    private void processWaitingGraphicEvents(AGISGL gl) {
+        ArrayList<IGISGraphic> cloneGraphics = new ArrayList<>(waitingGraphicEvents);
+        waitingGraphicEvents.clear();
+        while (!cloneGraphics.isEmpty()) {
+            IGISGraphic graphic = cloneGraphics.get(0);
+            if (graphic == null) {
+                cloneGraphics.remove(0);
+                return;
+            }
+
+            try {
+                if (graphic.getClientProperty("Event") == null) {
+                    graphic.putClientProperty("Event", 1);
+                }
+                if ((Integer) graphic.getClientProperty("Event") == 0) {
+                    addGraphic(graphic);
+                } else if ((Integer) graphic.getClientProperty("Event") == 1) {
+                    removeGraphic(graphic, gl);
+                } else if ((Integer) graphic.getClientProperty("Event") == 2) {
+                    removeControllerGraphicProcess(graphic, gl);
+                } else if ((Integer) graphic.getClientProperty("Event") == 3) {
+                    addControllerGraphicProcess(graphic);
+                }
+                cloneGraphics.remove(0);
+            } catch (Exception e) {
+                LOGGER.error(e.getMessage());
+            }
+        }
+    }
+
+
+    private void addGraphic(IGISGraphic graphic) {
+        try {
+            if (graphic.isScreenGraphic() && !screenGraphics.contains(graphic)) {
+                screenGraphics.add(graphic);
+            } else if (graphic instanceof IGISGraphicIcon) {
+                pointAggGraphic.addChild(graphic);
+            } else {
+                if (!(graphic instanceof IGISLayer && ((IGISLayer) graphic).getRefreshRate() > 0)) {
+                    getDrawingLayer().addChild(graphic);
+                }
+            }
+        } catch (Exception e) {
+            LOGGER.error(e.getMessage());
+        }
+    }
+
+    private void removeGraphic(IGISGraphic graphic, AGISGL gl) {
+        try {
+            if (graphic != null) {
+                ((AGraphic) graphic).deleteResources(gl);
+            }
+        } catch (Exception e) {
+            LOGGER.error(e.getMessage());
+        }
+    }
+
+    private void removeControllerGraphicProcess(IGISGraphic graphic, AGISGL gl) {
+        try {
+            if (graphic != null) {
+                ((AGraphic) graphic).deleteResources(gl);
+                if (graphic.isScreenGraphic()) {
+                    screenGraphics.remove(graphic);
+                } else {
+                    controllerGraphics.remove(graphic);
+                    controllerGraphicsLayer.removeChild(graphic);
+                }
+            }
+        } catch (Exception e) {
+            LOGGER.error(e.getMessage());
+        }
+    }
+
+    private void addControllerGraphicProcess(IGISGraphic graphic) {
+        if (graphic.isScreenGraphic() && !screenGraphics.contains(graphic)) {
+            screenGraphics.add(graphic);
+        } else {
+            controllerGraphics.add(graphic);
+            controllerGraphicsLayer.addChild(graphic);
+        }
+    }
+
+    public IGISGraphic add(IGISGraphic graphic) {
+        if (null == graphic) {
+            return null;
+        }
+        boolean contains = false;
+        graphic.putClientProperty("Event", 0);
+        for (int i = 0; i < waitingGraphicEvents.size(); i++) {
+            try {
+                if (waitingGraphicEvents.get(i) != null && waitingGraphicEvents.get(i).getName().equals(graphic.getName())) {
+                    contains = true;
+                }
+            } catch (Exception e) {
+                LOGGER.error(e.getMessage());
+            }
+        }
+        if (!contains) {
+            waitingGraphicEvents.add(graphic);
+        }
+        return graphic;
+    }
+
+    public IGISGraphic addControllerGraphic(IGISGraphic graphic) {
+        if (null == graphic) {
+            return null;
+        }
+        graphic.putClientProperty("Event", 3);
+        if (waitingGraphicEvents.contains(graphic)) {
+            return graphic;
+        }
+        waitingGraphicEvents.add(graphic);
+        return graphic;
+    }
+
+    public void remove(IGISGraphic graphic) {
+        if (graphic == cartographyAggGraphic) {
+            return;
+        }
+        if (null == graphic) {
+            return;
+        }
+
+        graphic.putClientProperty("Event", 1);
+        waitingGraphicEvents.add(graphic);
+        List<IGISGraphic> boundGraphics = graphic.getBoundGraphics();
+        if (null != boundGraphics) {
+            graphic.unbindAllGraphics();
+            for (IGISGraphic boundGraphic : boundGraphics) {
+                for (int i = 0; i < waitingGraphicEvents.size(); i++) {
+                    try {
+                        if (waitingGraphicEvents.get(i).getName().toLowerCase().equals(boundGraphic.getName())) {
+                            waitingGraphicEvents.add(boundGraphic);
+                        }
+                    } catch (Exception ignored) {
+
+                    }
+                }
+            }
+        }
+    }
+
+    public void removeControllerGraphic(IGISGraphic graphic) {
+        if (null == graphic) {
+            return;
+        }
+        graphic.putClientProperty("Event", 2);
+        if (waitingGraphicEvents.contains(graphic)) {
+            return;
+        }
+        waitingGraphicEvents.add(graphic);
+    }
+
+    public ArrayList<IGISGraphic> getWaitingGraphicAddEvents() {
+        return waitingGraphicAddEvents;
+    }
+
+    public ArrayList<IGISGraphic> getWaitingControllerGraphicAddEvents() {
+        return waitingGraphicAddEvents;
+    }
+
+    public void processEvents(AGISGL gl) {
+        processWaitingGraphicEvents(gl);
+    }
+
+    public ArrayList<IGISGraphic> getControllerGraphics() {
+        return controllerGraphics;
+    }
+
+    public ArrayList<IGISGraphic> getScreenGraphics() {
+        return screenGraphics;
+    }
+
+    @Override
+    public IGISLayer getRoot() {
+        return rootAggGraphic;
+    }
+
+    @Override
+    public IGISLayer getDrawingLayer() {
+        if (drawingAggGraphic.getParent() == null) {
+            drawingAggGraphic = rootAggGraphic;
+        }
+        return drawingAggGraphic;
+    }
+
+    @Override
+    public IGISLayer getPointsLayer() {
+        return pointAggGraphic;
+    }
+
+    @Override
+    public IGISLayer getDtedLayer() {
+        if (dtedAggGraphic == null) {
+            dtedAggGraphic = new LayerGraphic("Dted", cartographyAggGraphic);
+        }
+        return dtedAggGraphic;
+    }
+
+    @Override
+    public IGISLayer getNitfLayer() {
+        if (nitfAggGraphic == null) {
+            nitfAggGraphic = new LayerGraphic("Nitf", cartographyAggGraphic);
+        }
+        return nitfAggGraphic;
+    }
+
+    @Override
+    public IGISLayer getWebMapLayer() {
+        if (wmsLayer == null) {
+            wmsLayer = new LayerGraphic("WMS", cartographyAggGraphic);
+        }
+        return wmsLayer;
+    }
+
+    @Override
+    public IGISLayer getEcdisMapLayer() {
+        if (ecdisAggGraphic == null) {
+            ecdisAggGraphic = new LayerGraphic("Ecdis", cartographyAggGraphic);
+        }
+        return ecdisAggGraphic;
+    }
+
+    @Override
+    public IGISLayer getWebFeatureLayer() {
+        if (wfsLayer == null) {
+            wfsLayer = new LayerGraphic("WebWFS", cartographyAggGraphic);
+        }
+        return wfsLayer;
+    }
+
+    @Override
+    public IGISLayer getWebCoverageLayer() {
+        if (wcsLayer == null) {
+            wcsLayer = new LayerGraphic("WCS", cartographyAggGraphic);
+        }
+        return wcsLayer;
+    }
+
+    @Override
+    public IGISLayer getCartographyLayer() {
+        return cartographyAggGraphic;
+    }
+
+    @Override
+    public IGISLayer getAnalysisLayer() {
+        if (null == analysisLayer) {
+            analysisLayer = new ImmutableLayer("Analysis", staticLayer);
+        }
+        return analysisLayer;
+    }
+
+    @Override
+    public void setDrawingLayer(IGISLayer layer) {
+        layer.set3DRenderingProperty(RenderingProperty.ENABLE_DEPTH_MASK, true);
+
+        if (drawingAggGraphic == layer) {
+            return;
+        }
+        drawingAggGraphic = layer;
+    }
+
+    @Override
+    public void setCartographyLayer(IGISLayer layer) {
+        if (layer != null) {
+            cartographyAggGraphic = layer;
+        } else {
+            cartographyAggGraphic = rootAggGraphic;
+        }
+    }
+
+    @Override
+    public void setNitfLayer(IGISLayer layer) {
+        IGISGraphic[] children = nitfAggGraphic.getChildren();
+        nitfAggGraphic = layer;
+        nitfAggGraphic.setChildren(children);
+    }
+
+    @Override
+    public void setDtedLayer(IGISLayer layer) {
+        IGISGraphic[] children = dtedAggGraphic.getChildren();
+        dtedAggGraphic = layer;
+        dtedAggGraphic.setChildren(children);
+    }
+
+    @Override
+    public void setEcdisLayer(IGISLayer layer) {
+        ecdisAggGraphic = layer;
+    }
+
+    @Override
+    public void setPointsLayer(IGISLayer layer) {
+        if (pointAggGraphic != null) {
+            rootAggGraphic.removeChild(pointAggGraphic);
+            pointAggGraphic.dispose();
+        }
+        pointAggGraphic = layer;
+        rootAggGraphic.addChild(pointAggGraphic);
+    }
