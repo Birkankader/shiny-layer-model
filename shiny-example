@@ -2,8 +2,8 @@
 // Created by HAVELSAN
 /*************************************************************************************
  * SECURITY CLASSIFICATION  : UNCLASSIFIED
- * PURPOSE                  : -
- * COMMENTS                 : -
+ * PURPOSE                  : 5-radar stress test — maintains ~4500 graphics on screen
+ * COMMENTS                 : Each radar thread owns 900 graphics (5 x 900 = 4500)
  **************************************************************************************/
 
 package tr.com.havelsan.tmap.demos;
@@ -22,19 +22,25 @@ import tr.com.havelsan.tmap.impl.util.ImageUtil;
 import tr.com.havelsan.tmap.impl.view.Map2D;
 
 import javax.swing.*;
-import java.util.Timer;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 
 public class ExampleGraphicIconAddRmvAnmte implements Runnable {
 
+    private static final int RADAR_COUNT = 5;
+    private static final int GRAPHICS_PER_RADAR = 900;  // 5 x 900 = 4500 total
+    private static final long GRAPHIC_TTL_MS = 12_000;   // 12 saniye yaşam süresi
+    private static final long ADD_INTERVAL_MS = 3;        // add'ler arası bekleme
+    private static final long CLEANUP_INTERVAL_MS = 1_000; // temizlik periyodu
+
     Map2D map;
     GISCommonFactory commonFactory;
-    ArrayList<IGISGraphic> graphicArrayList = new ArrayList<>();
-    Map<IGISGraphic, Long> graphicMap = new ConcurrentHashMap<>();
     String[] symbolIdArray = new String[3];
     boolean app6Flag = false;
+    private final AtomicBoolean running = new AtomicBoolean(false);
 
     public static void main(String[] args) {
         ExampleGraphicIconAddRmvAnmte aMain = new ExampleGraphicIconAddRmvAnmte();
@@ -49,44 +55,19 @@ public class ExampleGraphicIconAddRmvAnmte implements Runnable {
         JPanel aPanelTop = new JPanel();
         mainFrame.add(aPanelTop);
 
-        // API entry point
         MapBuilder mapBuilder = commonFactory.createMapBuilder(aPanelTop);
         mapBuilder.displayExampleDted(true)
             .setTargetFPS(12)
             .setBufferType(IGISMap2D.BUFFER_TYPE_LIGHTWEIGHT);
         map = (Map2D) commonFactory.createMap(mapBuilder);
         map.setMaxFpsOnInteraction(false);
-
-        // Sets background color to gray
         map.setBackgroundColor(0.501960813999176, 0.501960813999176, 0.501960813999176, 1.0);
         mainFrame.setSize(1920, 1000);
         mainFrame.setVisible(true);
+
         SymbolManager.getInstance().addToImageMap("CUSTOM_ICON1", new TmapBufferedImage(ImageUtil.getResourceAsStream("delete.png")));
         SymbolManager.getInstance().addToImageMap("CUSTOM_ICON2", new TmapBufferedImage(ImageUtil.getResourceAsStream("2dMap.png")));
-
-        IGISGraphicIcon graphicIcon = commonFactory.createGraphicIcon();
-        graphicIcon.setCustomSymbol(true);
-        graphicIcon.setName("test");
-        graphicIcon.setSymbolId("CUSTOM_ICON1");
-        graphicIcon.setPosition(new GISPosition(36, 37, 0));
-        map.add(graphicIcon);
-
-        IGISGraphicIcon graphicIcon1 = commonFactory.createGraphicIcon();
-        graphicIcon1.setCustomSymbol(true);
-        graphicIcon1.setName("test");
-        graphicIcon1.setSymbolId("CUSTOM_ICON1");
-        graphicIcon1.setPosition(new GISPosition(36, 37, 0));
-        map.add(graphicIcon1);
-
-        IGISGraphicIcon graphicIcon2 = commonFactory.createGraphicIcon();
-        graphicIcon2.setCustomSymbol(true);
-        graphicIcon2.setName("test");
-        graphicIcon2.setSymbolId("CUSTOM_ICON2");
-        graphicIcon2.setPosition(new GISPosition(36, 37, 0));
-        map.add(graphicIcon2);
-//        graphicIcon1.makeAnimation(12000, null, IGISGraphic.ANIMATE_FADE);
-//        graphicIcon2.makeAnimation(12000, null, IGISGraphic.ANIMATE_FADE);
-//        graphicIcon.makeAnimation(12000, null, IGISGraphic.ANIMATE_FADE);
+        SymbolManager.getInstance().addToImageMap("CUSTOM_ICON3", new TmapBufferedImage(ImageUtil.getResourceAsStream("3dMap.png")));
 
         map.getOSD().setTestButtonPressListener(new IGISMapOSD.TestButtonPressListener() {
             @Override
@@ -96,82 +77,135 @@ public class ExampleGraphicIconAddRmvAnmte implements Runnable {
         });
     }
 
-
     public void runWithCustomIcon() {
-        SymbolManager.getInstance().addToImageMap("CUSTOM_ICON1", new TmapBufferedImage(ImageUtil.getResourceAsStream("delete.png")));
-        SymbolManager.getInstance().addToImageMap("CUSTOM_ICON2", new TmapBufferedImage(ImageUtil.getResourceAsStream("2dMap.png")));
-        SymbolManager.getInstance().addToImageMap("CUSTOM_ICON3", new TmapBufferedImage(ImageUtil.getResourceAsStream("3dMap.png")));
         symbolIdArray[0] = "CUSTOM_ICON1";
         symbolIdArray[1] = "CUSTOM_ICON2";
         symbolIdArray[2] = "CUSTOM_ICON3";
         app6Flag = false;
-        runThreads();
+        startRadars();
     }
 
-    private void runWithAppIcon() {
-        symbolIdArray[0] = "App6B:FIG_IMF";
-        symbolIdArray[1] = "APP6A:G*C*BWDP";
-        symbolIdArray[2] = "App6B:FIG_UCDH_H";
-        app6Flag = true;
-        runThreads();
-    }
+    /**
+     * 5 radar thread'ini başlatır. Her radar kendi 900'lük graphic havuzunu yönetir.
+     * Ekranda sürekli ~4500 graphic bulunur.
+     *
+     * Her radar thread'in yaşam döngüsü:
+     *   1) 900 graphic'i peş peşe add eder (aralarında 3ms bekleme — gerçek radar simülasyonu)
+     *   2) TTL süresi dolan graphic'leri remove eder
+     *   3) Remove edilen kadar yeni graphic add eder → sayı hep 900'de kalır
+     */
+    private void startRadars() {
+        if (running.getAndSet(true)) {
+            return; // zaten çalışıyor
+        }
 
-    public void runThreads() {
         double screenWidth = ((IGISMap2DState) map.getState()).getPixelWidth();
         double screenHeight = ((IGISMap2DState) map.getState()).getPixelHeight();
-        Timer t2 = new Timer();
-        t2.scheduleAtFixedRate(new TimerTask() {
-            @Override
-            public void run() {
-                double aLat;
-                double aLon;
-                for (int i = 0; i < 4000; i++) {
-                    Random rand = new Random();
-                    int randNum = rand.nextInt(3 - 1) + 1;
-                    IGISGraphicIcon graphicIcon = commonFactory.createGraphicIcon();
-                    graphicIcon.setCustomSymbol(true);
-                    graphicIcon.setName("test" + i);
-                    graphicIcon.setSymbolId(symbolIdArray[randNum]);
-                    if (app6Flag) {
-                        graphicIcon.getApp6Info().setSymbolID(symbolIdArray[randNum]);
-                    }
-                    graphicIcon.getPointSymbolizer().setAggregatable(true);
-                    double[] latlon = map.screenToLatLon(screenWidth * Math.random(),
-                        screenHeight * Math.random());
 
-                    aLon = latlon[1];
-                    aLat = latlon[0];
-                    graphicIcon.setPosition(new GISPosition(aLon, aLat, 0));
-                    graphicIcon.setAsScreenGraphic(true, false);
-                    map.add(graphicIcon);
-                    graphicMap.put(graphicIcon, System.currentTimeMillis());
-                    graphicIcon.makeAnimation(12000, null, IGISGraphic.ANIMATE_FADE);
-                    try {
-                        Thread.sleep(3);
-                    } catch (InterruptedException e) {
-                        e.printStackTrace();
-                    }
+        for (int radarId = 0; radarId < RADAR_COUNT; radarId++) {
+            final int rid = radarId;
+            Thread radarThread = new Thread(() -> runRadar(rid, screenWidth, screenHeight),
+                "Radar-" + rid);
+            radarThread.setDaemon(true);
+            radarThread.start();
+        }
+    }
+
+    /**
+     * Tek bir radar thread'i. Kendi graphic listesini yönetir.
+     * İlk doldurma (900 adet) sonrası sürekli rotate: expire olanı sil, yerine yenisini koy.
+     */
+    private void runRadar(int radarId, double screenWidth, double screenHeight) {
+        // Her radar'ın kendi graphic havuzu — ekleme sırasına göre (FIFO)
+        Deque<GraphicEntry> activeGraphics = new ConcurrentLinkedDeque<>();
+        int graphicSeq = 0;
+
+        // --- İlk doldurma: 900 graphic ekle ---
+        for (int i = 0; i < GRAPHICS_PER_RADAR; i++) {
+            IGISGraphicIcon icon = createIcon(radarId, graphicSeq++, screenWidth, screenHeight);
+            map.add(icon);
+            activeGraphics.addLast(new GraphicEntry(icon, System.currentTimeMillis()));
+            sleep(ADD_INTERVAL_MS);
+        }
+
+        // --- Sürekli döngü: expire → remove → add ---
+        while (running.get()) {
+            int removed = 0;
+
+            // TTL'i dolmuş graphic'leri kuyruğun başından temizle
+            while (!activeGraphics.isEmpty()) {
+                GraphicEntry oldest = activeGraphics.peekFirst();
+                if (oldest != null && System.currentTimeMillis() - oldest.addedAt >= GRAPHIC_TTL_MS) {
+                    activeGraphics.pollFirst();
+                    map.remove(oldest.graphic);
+                    map.getPointsLayer().removeChild(oldest.graphic);
+                    removed++;
+                } else {
+                    break;
                 }
             }
-        }, 0, 12000);
 
-        Timer t = new Timer();
-        t.scheduleAtFixedRate(new TimerTask() {
-            @Override
-            public void run() {
-                for (Map.Entry<IGISGraphic, Long> entry : graphicMap.entrySet()) {
-                    if (System.currentTimeMillis() - entry.getValue() >= 12000) {
-                        graphicArrayList.add(entry.getKey());
-                    }
-                }
-
-                for (IGISGraphic graphic : graphicArrayList) {
-                    map.remove(graphic);
-                    map.getPointsLayer().removeChild(graphic);
-                    graphicMap.remove(graphic);
-                }
-                graphicArrayList.clear();
+            // Remove edilen kadar yenisini ekle → toplam hep 900'de kalır
+            for (int i = 0; i < removed; i++) {
+                IGISGraphicIcon icon = createIcon(radarId, graphicSeq++, screenWidth, screenHeight);
+                map.add(icon);
+                activeGraphics.addLast(new GraphicEntry(icon, System.currentTimeMillis()));
+                sleep(ADD_INTERVAL_MS);
             }
-        }, 0, 1000);
+
+            // Henüz expire olmamışsa kısa bekle, busy-loop olmasın
+            if (removed == 0) {
+                sleep(CLEANUP_INTERVAL_MS);
+            }
+        }
+    }
+
+    /**
+     * Tek bir graphic icon oluşturur. Pozisyon ekran sınırları içinde rastgele.
+     */
+    private IGISGraphicIcon createIcon(int radarId, int seq, double screenWidth, double screenHeight) {
+        ThreadLocalRandom rand = ThreadLocalRandom.current();
+
+        IGISGraphicIcon icon = commonFactory.createGraphicIcon();
+        icon.setCustomSymbol(true);
+        icon.setName("radar" + radarId + "_t" + seq);
+        icon.setSymbolId(symbolIdArray[rand.nextInt(symbolIdArray.length)]);
+
+        if (app6Flag) {
+            icon.getApp6Info().setSymbolID(icon.getSymbolId());
+        }
+
+        icon.getPointSymbolizer().setAggregatable(true);
+
+        double[] latlon = map.screenToLatLon(
+            screenWidth * rand.nextDouble(),
+            screenHeight * rand.nextDouble()
+        );
+        icon.setPosition(new GISPosition(latlon[1], latlon[0], 0));
+        icon.setAsScreenGraphic(true, false);
+        icon.makeAnimation(GRAPHIC_TTL_MS, null, IGISGraphic.ANIMATE_FADE);
+
+        return icon;
+    }
+
+    private static void sleep(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /**
+     * Graphic + ekleme zamanı çifti. TTL kontrolü için kullanılır.
+     */
+    private static final class GraphicEntry {
+        final IGISGraphic graphic;
+        final long addedAt;
+
+        GraphicEntry(IGISGraphic graphic, long addedAt) {
+            this.graphic = graphic;
+            this.addedAt = addedAt;
+        }
     }
 }
