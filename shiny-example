@@ -1,0 +1,380 @@
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.Collections;
+import java.util.LinkedHashSet;
+
+    // --- Faz 1: Event Wrapper ---
+    private static final class GraphicEvent {
+        static final int ADD = 0, REMOVE = 1, REMOVE_CONTROLLER = 2, ADD_CONTROLLER = 3;
+        final IGISGraphic graphic;
+        final int type;
+        final Object dedupKey;
+        GraphicEvent(IGISGraphic graphic, int type, Object dedupKey) {
+            this.graphic = graphic;
+            this.type = type;
+            this.dedupKey = dedupKey;
+        }
+    }
+
+    // --- Faz 2: Identity-based dedup key for null-name graphics ---
+    private static final class IdentityKey {
+        private final Object ref;
+        IdentityKey(Object ref) { this.ref = ref; }
+        @Override public int hashCode() { return System.identityHashCode(ref); }
+        @Override public boolean equals(Object o) {
+            return o instanceof IdentityKey && ((IdentityKey) o).ref == this.ref;
+        }
+    }
+
+    private IGISLayer rootAggGraphic = new LayerGraphic("root", null);
+    private IGISLayer staticLayer = new StaticLayer(rootAggGraphic);
+    private IGISLayer interactiveLayer = new LayerGraphic("Interactive", rootAggGraphic);
+    private IGISLayer defaultLayer = new LayerGraphic("Default", rootAggGraphic);
+
+    private IGISLayer cartographyAggGraphic = new LayerGraphic("Cartography", staticLayer);
+    private IGISLayer drawingAggGraphic = new LayerGraphic("Drawing", interactiveLayer);
+    private IGISLayer controllerGraphicsLayer = new ImmutableLayer("Controller", defaultLayer);
+    private IGISLayer analysisLayer = new ImmutableLayer("Analysis", staticLayer);
+    private IGISLayer pointAggGraphic;// = new LayerGraphic("Point", interactiveLayer);
+
+    private IGISLayer dtedAggGraphic = null;
+    private IGISLayer nitfAggGraphic = null;
+    private IGISLayer ecdisAggGraphic = null;
+    private IGISLayer wmsLayer = null;
+    private IGISLayer wcsLayer = null;
+    private IGISLayer wfsLayer;
+
+    // Faz 1: Thread-safe event queue with typed events
+    private final ConcurrentLinkedQueue<GraphicEvent> eventQueue = new ConcurrentLinkedQueue<>();
+    // Faz 2: O(1) duplicate check for pending add events (supports both String and IdentityKey)
+    private final ConcurrentHashMap.KeySetView<Object, Boolean> pendingKeys = ConcurrentHashMap.newKeySet();
+
+    // Faz 3: Internal O(1) structures
+    private final LinkedHashSet<IGISGraphic> screenGraphicsSet = new LinkedHashSet<>();
+    private final LinkedHashSet<IGISGraphic> controllerGraphicsSet = new LinkedHashSet<>();
+
+    // Faz 3: Dirty-flag cached snapshots for external consumers
+    private ArrayList<IGISGraphic> screenGraphicsSnapshot = new ArrayList<>();
+    private boolean screenGraphicsDirty = true;
+    private ArrayList<IGISGraphic> controllerGraphicsSnapshot = new ArrayList<>();
+    private boolean controllerGraphicsDirty = true;
+
+    private Map<IGISGraphic, DrawableGraphicInfo> drawableGraphicInfoMap = new HashMap<>();
+
+    // Faz 4: Reusable batch buffer (render thread only, no sync needed)
+    private final ArrayList<GraphicEvent> batchBuffer = new ArrayList<>(64);
+
+    public Map<IGISGraphic, DrawableGraphicInfo> getDrawableGraphicInfoMap() {
+        return drawableGraphicInfoMap;
+    }
+
+    public LayerModel() {
+    }
+
+    private static final Logger LOGGER = LogManager.getLogger(LayerModel.class);
+
+    // Faz 1 + Faz 4: Typed events, reusable batch, zero per-frame allocation
+    private void processWaitingGraphicEvents(AGISGL gl) {
+        GraphicEvent event;
+        while ((event = eventQueue.poll()) != null) {
+            batchBuffer.add(event);
+            // Faz 2: Remove dedup key so the same graphic can be re-added later
+            if (event.dedupKey != null) {
+                pendingKeys.remove(event.dedupKey);
+            }
+        }
+
+        if (batchBuffer.isEmpty()) return; // fast exit, zero alloc
+
+        for (int i = 0, n = batchBuffer.size(); i < n; i++) {
+            GraphicEvent e = batchBuffer.get(i);
+            try {
+                switch (e.type) {
+                    case GraphicEvent.ADD: addGraphic(e.graphic); break;
+                    case GraphicEvent.REMOVE: removeGraphic(e.graphic, gl); break;
+                    case GraphicEvent.REMOVE_CONTROLLER: removeControllerGraphicProcess(e.graphic, gl); break;
+                    case GraphicEvent.ADD_CONTROLLER: addControllerGraphicProcess(e.graphic); break;
+                }
+            } catch (Exception e2) {
+                LOGGER.error(e2.getMessage());
+            }
+        }
+        batchBuffer.clear(); // backing array retained, only size=0
+    }
+
+
+    // Faz 3: Use LinkedHashSet for O(1) contains check
+    private void addGraphic(IGISGraphic graphic) {
+        try {
+            if (graphic.isScreenGraphic() && screenGraphicsSet.add(graphic)) {
+                screenGraphicsDirty = true;
+            } else if (graphic instanceof IGISGraphicIcon) {
+                pointAggGraphic.addChild(graphic);
+            } else {
+                if (!(graphic instanceof IGISLayer && ((IGISLayer) graphic).getRefreshRate() > 0)) {
+                    getDrawingLayer().addChild(graphic);
+                }
+            }
+        } catch (Exception e) {
+            LOGGER.error(e.getMessage());
+        }
+    }
+
+    // Faz 5a: Clean up screenGraphicsSet and drawableGraphicInfoMap on remove
+    private void removeGraphic(IGISGraphic graphic, AGISGL gl) {
+        try {
+            if (graphic != null) {
+                ((AGraphic) graphic).deleteResources(gl);
+                if (screenGraphicsSet.remove(graphic)) {
+                    screenGraphicsDirty = true;
+                }
+                drawableGraphicInfoMap.remove(graphic);
+            }
+        } catch (Exception e) {
+            LOGGER.error(e.getMessage());
+        }
+    }
+
+    // Faz 3 + Faz 5b: O(1) remove + drawableGraphicInfoMap cleanup
+    private void removeControllerGraphicProcess(IGISGraphic graphic, AGISGL gl) {
+        try {
+            if (graphic != null) {
+                ((AGraphic) graphic).deleteResources(gl);
+                if (graphic.isScreenGraphic()) {
+                    if (screenGraphicsSet.remove(graphic)) {
+                        screenGraphicsDirty = true;
+                    }
+                } else {
+                    if (controllerGraphicsSet.remove(graphic)) {
+                        controllerGraphicsDirty = true;
+                    }
+                    controllerGraphicsLayer.removeChild(graphic);
+                }
+                drawableGraphicInfoMap.remove(graphic);
+            }
+        } catch (Exception e) {
+            LOGGER.error(e.getMessage());
+        }
+    }
+
+    // Faz 3: O(1) contains/add via LinkedHashSet
+    private void addControllerGraphicProcess(IGISGraphic graphic) {
+        if (graphic.isScreenGraphic() && screenGraphicsSet.add(graphic)) {
+            screenGraphicsDirty = true;
+        } else if (!graphic.isScreenGraphic()) {
+            if (controllerGraphicsSet.add(graphic)) {
+                controllerGraphicsDirty = true;
+            }
+            controllerGraphicsLayer.addChild(graphic);
+        }
+    }
+
+    // Faz 1 + Faz 2: Typed event, identity-based dedup for null-name graphics
+    public IGISGraphic add(IGISGraphic graphic) {
+        if (graphic == null) {
+            return null;
+        }
+        String name = graphic.getName();
+        Object dedupKey = (name != null) ? name : new IdentityKey(graphic);
+        if (pendingKeys.add(dedupKey)) {
+            eventQueue.offer(new GraphicEvent(graphic, GraphicEvent.ADD, dedupKey));
+        }
+        return graphic;
+    }
+
+    // Faz 1 + Faz 2: Typed event, dedup for controller graphics too
+    public IGISGraphic addControllerGraphic(IGISGraphic graphic) {
+        if (graphic == null) {
+            return null;
+        }
+        String name = graphic.getName();
+        Object dedupKey = (name != null) ? name : new IdentityKey(graphic);
+        if (pendingKeys.add(dedupKey)) {
+            eventQueue.offer(new GraphicEvent(graphic, GraphicEvent.ADD_CONTROLLER, dedupKey));
+        }
+        return graphic;
+    }
+
+    // Faz 1: Typed event, no dedup for remove (removing is never skipped)
+    public void remove(IGISGraphic graphic) {
+        if (graphic == cartographyAggGraphic || graphic == null) {
+            return;
+        }
+
+        eventQueue.offer(new GraphicEvent(graphic, GraphicEvent.REMOVE, null));
+
+        List<IGISGraphic> boundGraphics = graphic.getBoundGraphics();
+        if (boundGraphics != null) {
+            graphic.unbindAllGraphics();
+            for (IGISGraphic boundGraphic : boundGraphics) {
+                eventQueue.offer(new GraphicEvent(boundGraphic, GraphicEvent.REMOVE, null));
+            }
+        }
+    }
+
+    // Faz 1: Typed event, no dedup for remove
+    public void removeControllerGraphic(IGISGraphic graphic) {
+        if (graphic == null) {
+            return;
+        }
+        eventQueue.offer(new GraphicEvent(graphic, GraphicEvent.REMOVE_CONTROLLER, null));
+    }
+
+    @Deprecated
+    public List<IGISGraphic> getWaitingGraphicAddEvents() {
+        return Collections.emptyList();
+    }
+
+    @Deprecated
+    public List<IGISGraphic> getWaitingControllerGraphicAddEvents() {
+        return Collections.emptyList();
+    }
+
+    public void processEvents(AGISGL gl) {
+        processWaitingGraphicEvents(gl);
+    }
+
+    // Faz 3: Dirty-flag cached snapshot
+    public ArrayList<IGISGraphic> getControllerGraphics() {
+        if (controllerGraphicsDirty) {
+            controllerGraphicsSnapshot = new ArrayList<>(controllerGraphicsSet);
+            controllerGraphicsDirty = false;
+        }
+        return controllerGraphicsSnapshot;
+    }
+
+    // Faz 3: Dirty-flag cached snapshot
+    public ArrayList<IGISGraphic> getScreenGraphics() {
+        if (screenGraphicsDirty) {
+            screenGraphicsSnapshot = new ArrayList<>(screenGraphicsSet);
+            screenGraphicsDirty = false;
+        }
+        return screenGraphicsSnapshot;
+    }
+
+    @Override
+    public IGISLayer getRoot() {
+        return rootAggGraphic;
+    }
+
+    @Override
+    public IGISLayer getDrawingLayer() {
+        if (drawingAggGraphic.getParent() == null) {
+            drawingAggGraphic = rootAggGraphic;
+        }
+        return drawingAggGraphic;
+    }
+
+    @Override
+    public IGISLayer getPointsLayer() {
+        return pointAggGraphic;
+    }
+
+    @Override
+    public IGISLayer getDtedLayer() {
+        if (dtedAggGraphic == null) {
+            dtedAggGraphic = new LayerGraphic("Dted", cartographyAggGraphic);
+        }
+        return dtedAggGraphic;
+    }
+
+    @Override
+    public IGISLayer getNitfLayer() {
+        if (nitfAggGraphic == null) {
+            nitfAggGraphic = new LayerGraphic("Nitf", cartographyAggGraphic);
+        }
+        return nitfAggGraphic;
+    }
+
+    @Override
+    public IGISLayer getWebMapLayer() {
+        if (wmsLayer == null) {
+            wmsLayer = new LayerGraphic("WMS", cartographyAggGraphic);
+        }
+        return wmsLayer;
+    }
+
+    @Override
+    public IGISLayer getEcdisMapLayer() {
+        if (ecdisAggGraphic == null) {
+            ecdisAggGraphic = new LayerGraphic("Ecdis", cartographyAggGraphic);
+        }
+        return ecdisAggGraphic;
+    }
+
+    @Override
+    public IGISLayer getWebFeatureLayer() {
+        if (wfsLayer == null) {
+            wfsLayer = new LayerGraphic("WebWFS", cartographyAggGraphic);
+        }
+        return wfsLayer;
+    }
+
+    @Override
+    public IGISLayer getWebCoverageLayer() {
+        if (wcsLayer == null) {
+            wcsLayer = new LayerGraphic("WCS", cartographyAggGraphic);
+        }
+        return wcsLayer;
+    }
+
+    @Override
+    public IGISLayer getCartographyLayer() {
+        return cartographyAggGraphic;
+    }
+
+    @Override
+    public IGISLayer getAnalysisLayer() {
+        if (null == analysisLayer) {
+            analysisLayer = new ImmutableLayer("Analysis", staticLayer);
+        }
+        return analysisLayer;
+    }
+
+    @Override
+    public void setDrawingLayer(IGISLayer layer) {
+        layer.set3DRenderingProperty(RenderingProperty.ENABLE_DEPTH_MASK, true);
+
+        if (drawingAggGraphic == layer) {
+            return;
+        }
+        drawingAggGraphic = layer;
+    }
+
+    @Override
+    public void setCartographyLayer(IGISLayer layer) {
+        if (layer != null) {
+            cartographyAggGraphic = layer;
+        } else {
+            cartographyAggGraphic = rootAggGraphic;
+        }
+    }
+
+    @Override
+    public void setNitfLayer(IGISLayer layer) {
+        IGISGraphic[] children = nitfAggGraphic.getChildren();
+        nitfAggGraphic = layer;
+        nitfAggGraphic.setChildren(children);
+    }
+
+    @Override
+    public void setDtedLayer(IGISLayer layer) {
+        IGISGraphic[] children = dtedAggGraphic.getChildren();
+        dtedAggGraphic = layer;
+        dtedAggGraphic.setChildren(children);
+    }
+
+    @Override
+    public void setEcdisLayer(IGISLayer layer) {
+        ecdisAggGraphic = layer;
+    }
+
+    @Override
+    public void setPointsLayer(IGISLayer layer) {
+        if (pointAggGraphic != null) {
+            rootAggGraphic.removeChild(pointAggGraphic);
+            pointAggGraphic.dispose();
+        }
+        pointAggGraphic = layer;
+        rootAggGraphic.addChild(pointAggGraphic);
+    }
