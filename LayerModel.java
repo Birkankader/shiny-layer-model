@@ -1,6 +1,7 @@
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.HashSet;
 import java.util.Set;
 
@@ -29,6 +30,7 @@ import java.util.Set;
 
     private ArrayList<IGISGraphic> controllerGraphics = new ArrayList<>();
     private ArrayList<IGISGraphic> screenGraphics = new ArrayList<>();
+    private final Set<IGISGraphic> screenGraphicSet = new HashSet<>();
     private Map<IGISGraphic, DrawableGraphicInfo> drawableGraphicInfoMap = new HashMap<>();
 
     private boolean addProcessFinished = false;
@@ -56,38 +58,22 @@ import java.util.Set;
         }
 
         // Coalesce: cancel out add(0)/remove(1) pairs for the same graphic
-        Map<IGISGraphic, Integer> lastAddRemoveIndex = new HashMap<>();
-        Set<Integer> discarded = new HashSet<>();
+        // Single-pass: IdentityHashMap avoids hashCode/equals overhead, null-out instead of rebuilding
+        IdentityHashMap<IGISGraphic, int[]> seen = new IdentityHashMap<>();
 
         for (int i = 0; i < batch.size(); i++) {
             IGISGraphic g = batch.get(i);
             Integer eventType = (Integer) g.getClientProperty("Event");
             if (eventType == null || (eventType != 0 && eventType != 1)) continue;
 
-            if (lastAddRemoveIndex.containsKey(g)) {
-                int prevIdx = lastAddRemoveIndex.get(g);
-                if (!discarded.contains(prevIdx)) {
-                    Integer prevType = (Integer) batch.get(prevIdx).getClientProperty("Event");
-                    if (!eventType.equals(prevType)) {
-                        // Opposite operations for same graphic → discard both
-                        discarded.add(prevIdx);
-                        discarded.add(i);
-                        lastAddRemoveIndex.remove(g);
-                        continue;
-                    }
-                }
+            int[] prev = seen.get(g);
+            if (prev != null && prev[1] != eventType) {
+                batch.set(prev[0], null);
+                batch.set(i, null);
+                seen.remove(g);
+            } else {
+                seen.put(g, new int[]{i, eventType});
             }
-            lastAddRemoveIndex.put(g, i);
-        }
-
-        if (!discarded.isEmpty()) {
-            List<IGISGraphic> coalesced = new ArrayList<>();
-            for (int i = 0; i < batch.size(); i++) {
-                if (!discarded.contains(i)) {
-                    coalesced.add(batch.get(i));
-                }
-            }
-            batch = coalesced;
         }
 
         // Process the batch
@@ -116,7 +102,7 @@ import java.util.Set;
             if (targetLayer != null) {
                 targetLayer.addChild(graphic);
                 graphic.putClientProperty("TargetLayer", null);
-            } else if (graphic.isScreenGraphic() && !screenGraphics.contains(graphic)) {
+            } else if (graphic.isScreenGraphic() && screenGraphicSet.add(graphic)) {
                 screenGraphics.add(graphic);
             } else if (graphic instanceof IGISGraphicIcon) {
                 pointAggGraphic.addChild(graphic);
@@ -146,6 +132,7 @@ import java.util.Set;
                 ((AGraphic) graphic).deleteResources(gl);
                 if (graphic.isScreenGraphic()) {
                     screenGraphics.remove(graphic);
+                    screenGraphicSet.remove(graphic);
                 } else {
                     controllerGraphics.remove(graphic);
                     controllerGraphicsLayer.removeChild(graphic);
@@ -157,7 +144,7 @@ import java.util.Set;
     }
 
     private void addControllerGraphicProcess(IGISGraphic graphic) {
-        if (graphic.isScreenGraphic() && !screenGraphics.contains(graphic)) {
+        if (graphic.isScreenGraphic() && screenGraphicSet.add(graphic)) {
             screenGraphics.add(graphic);
         } else {
             controllerGraphics.add(graphic);
