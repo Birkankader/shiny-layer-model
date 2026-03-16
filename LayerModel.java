@@ -1,6 +1,8 @@
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.Collections;
+import java.util.HashSet;
+import java.util.Set;
 
     private IGISLayer rootAggGraphic = new LayerGraphic("root", null);
     private IGISLayer staticLayer = new StaticLayer(rootAggGraphic);
@@ -53,6 +55,41 @@ import java.util.Collections;
             }
         }
 
+        // Coalesce: cancel out add(0)/remove(1) pairs for the same graphic
+        Map<IGISGraphic, Integer> lastAddRemoveIndex = new HashMap<>();
+        Set<Integer> discarded = new HashSet<>();
+
+        for (int i = 0; i < batch.size(); i++) {
+            IGISGraphic g = batch.get(i);
+            Integer eventType = (Integer) g.getClientProperty("Event");
+            if (eventType == null || (eventType != 0 && eventType != 1)) continue;
+
+            if (lastAddRemoveIndex.containsKey(g)) {
+                int prevIdx = lastAddRemoveIndex.get(g);
+                if (!discarded.contains(prevIdx)) {
+                    Integer prevType = (Integer) batch.get(prevIdx).getClientProperty("Event");
+                    if (!eventType.equals(prevType)) {
+                        // Opposite operations for same graphic → discard both
+                        discarded.add(prevIdx);
+                        discarded.add(i);
+                        lastAddRemoveIndex.remove(g);
+                        continue;
+                    }
+                }
+            }
+            lastAddRemoveIndex.put(g, i);
+        }
+
+        if (!discarded.isEmpty()) {
+            List<IGISGraphic> coalesced = new ArrayList<>();
+            for (int i = 0; i < batch.size(); i++) {
+                if (!discarded.contains(i)) {
+                    coalesced.add(batch.get(i));
+                }
+            }
+            batch = coalesced;
+        }
+
         // Process the batch
         for (IGISGraphic g : batch) {
             if (g == null) continue;
@@ -75,7 +112,11 @@ import java.util.Collections;
 
     private void addGraphic(IGISGraphic graphic) {
         try {
-            if (graphic.isScreenGraphic() && !screenGraphics.contains(graphic)) {
+            IGISLayer targetLayer = (IGISLayer) graphic.getClientProperty("TargetLayer");
+            if (targetLayer != null) {
+                targetLayer.addChild(graphic);
+                graphic.putClientProperty("TargetLayer", null);
+            } else if (graphic.isScreenGraphic() && !screenGraphics.contains(graphic)) {
                 screenGraphics.add(graphic);
             } else if (graphic instanceof IGISGraphicIcon) {
                 pointAggGraphic.addChild(graphic);
@@ -135,6 +176,21 @@ import java.util.Collections;
             eventQueue.offer(graphic);
         } else if (name == null) {
             // Graphics without name are always added
+            eventQueue.offer(graphic);
+        }
+        return graphic;
+    }
+
+    public IGISGraphic add(IGISGraphic graphic, IGISLayer layer) {
+        if (graphic == null) {
+            return null;
+        }
+        graphic.putClientProperty("Event", 0);
+        graphic.putClientProperty("TargetLayer", layer);
+        String name = graphic.getName();
+        if (name != null && pendingNames.add(name)) {
+            eventQueue.offer(graphic);
+        } else if (name == null) {
             eventQueue.offer(graphic);
         }
         return graphic;
